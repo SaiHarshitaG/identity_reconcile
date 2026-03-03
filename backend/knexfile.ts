@@ -11,6 +11,14 @@ const config: Record<string, Knex.Config> = {
       directory: "./migrations",
       extension: "ts"
     }
+  },
+  production: {
+    client: "pg",
+    connection: process.env.DATABASE_URL,
+    migrations: {
+      directory: "./migrations",
+      extension: "ts"
+    }
   }
 };
 
