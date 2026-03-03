@@ -1,3 +1,4 @@
+import db from "../../config/db";
 import { ContactRepository } from "./contact.repository";
 import { IdentifyRequest } from "./contact.types";
 import { AppError } from "../../utils/AppError";
@@ -8,93 +9,110 @@ export class ContactService {
   async identify(data: IdentifyRequest) {
     const { email, phoneNumber } = data;
 
-    // Validation
     if (!email && !phoneNumber) {
       throw new AppError("Email or phoneNumber is required", 400);
     }
 
-    const matches = await this.repo.findMatches(email, phoneNumber);
+    return db.transaction(async (trx) => {
+      // Find matches inside transaction
+      const matches = await this.repo.findMatches(
+        email,
+        phoneNumber,
+        trx
+      );
 
-    // CASE 1: No match → create primary
-    if (matches.length === 0) {
-      const created = await this.repo.create({
-        email: email ?? null,
-        phoneNumber: phoneNumber ?? null,
-        linkPrecedence: "primary",
-        linkedId: null,
-      });
+      // CASE 1: No match
+      if (matches.length === 0) {
+        const created = await this.repo.create(
+          {
+            email: email ?? null,
+            phoneNumber: phoneNumber ?? null,
+            linkPrecedence: "primary",
+            linkedId: null,
+          },
+          trx
+        );
 
-      return this.buildResponse([created]);
-    }
-
-    // STEP 1: Find all involved primary IDs
-    const primaryIds = new Set<number>();
-
-    for (const contact of matches) {
-      if (contact.linkPrecedence === "primary") {
-        primaryIds.add(contact.id);
-      } else if (contact.linkedId) {
-        primaryIds.add(contact.linkedId);
+        return this.buildResponse([created]);
       }
-    }
 
-    // STEP 2: Fetch all contacts from all matched primary groups
-    let allContacts: any[] = [];
+      // Collect all primary IDs involved
+      const primaryIds = new Set<number>();
 
-    for (const primaryId of primaryIds) {
-      const group = await this.repo.findByPrimary(primaryId);
-      allContacts.push(...group);
-    }
-
-    // STEP 3: If multiple primaries → merge them
-    const primaryContacts = allContacts.filter(
-      (c) => c.linkPrecedence === "primary"
-    );
-
-    let finalPrimary = primaryContacts.sort(
-      (a, b) =>
-        new Date(a.createdAt).getTime() -
-        new Date(b.createdAt).getTime()
-    )[0]; // oldest primary
-
-    for (const primary of primaryContacts) {
-      if (primary.id !== finalPrimary.id) {
-        // Convert newer primary → secondary
-        await this.repo.update(primary.id, {
-          linkPrecedence: "secondary",
-          linkedId: finalPrimary.id,
-        });
+      for (const contact of matches) {
+        if (contact.linkPrecedence === "primary") {
+          primaryIds.add(contact.id);
+        } else if (contact.linkedId) {
+          primaryIds.add(contact.linkedId);
+        }
       }
-    }
 
-    // Re-fetch unified group
-    allContacts = await this.repo.findByPrimary(finalPrimary.id);
+      // Get full groups
+      let allContacts: any[] = [];
 
-    // Collect existing data
-    const emails = new Set(
-      allContacts.map((c) => c.email).filter(Boolean)
-    );
+      for (const primaryId of primaryIds) {
+        const group = await this.repo.findByPrimary(primaryId, trx);
+        allContacts.push(...group);
+      }
 
-    const phones = new Set(
-      allContacts.map((c) => c.phoneNumber).filter(Boolean)
-    );
+      // Merge multiple primaries
+      const primaryContacts = allContacts.filter(
+        (c) => c.linkPrecedence === "primary"
+      );
 
-    const isNewEmail = email && !emails.has(email);
-    const isNewPhone = phoneNumber && !phones.has(phoneNumber);
+      const finalPrimary = primaryContacts.sort(
+        (a, b) =>
+          new Date(a.createdAt).getTime() -
+          new Date(b.createdAt).getTime()
+      )[0];
 
-    // CASE 2: New info → create secondary
-    if (isNewEmail || isNewPhone) {
-      const newSecondary = await this.repo.create({
-        email: email ?? null,
-        phoneNumber: phoneNumber ?? null,
-        linkPrecedence: "secondary",
-        linkedId: finalPrimary.id,
-      });
+      for (const primary of primaryContacts) {
+        if (primary.id !== finalPrimary.id) {
+          await this.repo.update(
+            primary.id,
+            {
+              linkPrecedence: "secondary",
+              linkedId: finalPrimary.id,
+            },
+            trx
+          );
+        }
+      }
 
-      allContacts.push(newSecondary);
-    }
+      // Refresh unified group
+      allContacts = await this.repo.findByPrimary(
+        finalPrimary.id,
+        trx
+      );
 
-    return this.buildResponse(allContacts);
+      const existingEmails = new Set(
+        allContacts.map((c) => c.email).filter(Boolean)
+      );
+
+      const existingPhones = new Set(
+        allContacts.map((c) => c.phoneNumber).filter(Boolean)
+      );
+
+      const isNewEmail = email && !existingEmails.has(email);
+      const isNewPhone = phoneNumber && !existingPhones.has(phoneNumber);
+
+      // Insert new secondary if needed
+      if (isNewEmail || isNewPhone) {
+        const newSecondary = await this.repo.create(
+          {
+            email: email ?? null,
+            phoneNumber: phoneNumber ?? null,
+            linkPrecedence: "secondary",
+            linkedId: finalPrimary.id,
+          },
+          trx
+        );
+
+        allContacts.push(newSecondary);
+      }
+
+      return this.buildResponse(allContacts);
+    });
   }
 
   private buildResponse(contacts: any[]) {
